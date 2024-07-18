@@ -335,15 +335,15 @@ class PromptIR(nn.Module):
 
         inp_enc_level4 = self.down3_4(out_enc_level3)        
         latent = self.latent(inp_enc_level4)
+        #print(latent.shape)
         if self.decoder:
             dec3_param = self.prompt3(latent)
-
             latent = torch.cat([latent, dec3_param], 1)
             latent = self.noise_level3(latent)
             latent = self.reduce_noise_level3(latent)
+        #print(latent.shape)
                         
         inp_dec_level3 = self.up4_3(latent)
-
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
 
@@ -353,6 +353,7 @@ class PromptIR(nn.Module):
             out_dec_level3 = torch.cat([out_dec_level3, dec2_param], 1)
             out_dec_level3 = self.noise_level2(out_dec_level3)
             out_dec_level3 = self.reduce_noise_level2(out_dec_level3)
+        
 
         inp_dec_level2 = self.up3_2(out_dec_level3)
         inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
@@ -360,7 +361,6 @@ class PromptIR(nn.Module):
 
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
         if self.decoder:
-           
             dec1_param = self.prompt1(out_dec_level2)
             out_dec_level2 = torch.cat([out_dec_level2, dec1_param], 1)
             out_dec_level2 = self.noise_level1(out_dec_level2)
@@ -378,3 +378,17 @@ class PromptIR(nn.Module):
 
 
         return out_dec_level1
+
+
+if __name__ == "__main__":
+    input_size = 392
+    model_restoration = PromptIR(inp_channels=3, out_channels=3, dim=48, num_blocks=[4,6,6,8], 
+                                  num_refinement_blocks=4, heads=[1,2,4,8], ffn_expansion_factor=2.66, 
+                                  bias=False, LayerNorm_type='WithBias', decoder = True)
+
+    x = torch.randn(1, 3, 128, 128)
+    out = model_restoration(x)
+    print(out.shape)
+
+    print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model_restoration.parameters())/ 1e6))
+

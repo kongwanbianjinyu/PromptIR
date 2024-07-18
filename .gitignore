@@ -158,3 +158,24 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+
+*.png
+
+
+capromptxrestormerv2/
+capromptxrestormerv2_new/
+ckpt/
+output/
+output_ca_eff_infer/
+output_promptir/
+output_promptxrestormer_epoch47/
+output_promptxrestormer_epoch50/
+output_promptxrestormer_epoch61/
+output_promptxrestormer_epoch62/
+output_promptxrestormer_epoch64/
+promptxrestormer/
+promptxrestormereff/
+promptxrestormereffir/
+train_ckpt/
+wandb/

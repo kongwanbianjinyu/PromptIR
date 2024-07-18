@@ -16,25 +16,45 @@ from net.model import PromptIR
 import lightning.pytorch as pl
 import torch.nn.functional as F
 
-from net.prompt_uformer import PromptUformerIR
+from net.camixer_prompt_xrestormer_effv2 import CAPromptXRestormerEffv2
 
-class PromptUformerIRModel(pl.LightningModule):
+
+
+class CAPromptXRestormerEffv2IRModel(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        self.net = PromptUformerIR(embed_dim=32,win_size=8,token_projection='linear',token_mlp='leff',
-            depths=[1, 2, 8, 8, 2, 8, 8, 2, 1],modulator=True)  
+        
+        self.net =  CAPromptXRestormerEffv2(
+                    inp_channels=3,
+                    out_channels=3,
+                    dim = 48,
+                    num_blocks = [2,4,4,4],
+                    num_refinement_blocks = 4,
+                    channel_heads = [1,1,1,1],
+                    spatial_heads = [1,2,4,8],
+                    overlap_ratio = 0.5,
+                    dim_head = 16,
+                    ratio = 0.5,
+                    window_size = 8,
+                    bias = False,
+                    ffn_expansion_factor = 2.66,
+                    LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
+                    dual_pixel_task = False,        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
+                    scale = 1,
+                    prompt = True
+                    )
         self.loss_fn  = nn.L1Loss()
     
-    def forward(self,x):
-        return self.net(x)
+    def forward(self,x, training = True):
+        return self.net(x, training = training)
     
     def training_step(self, batch, batch_idx):
         # training_step defines the train loop.
         # it is independent of forward
         ([clean_name, de_id], degrad_patch, clean_patch) = batch
-        restored = self.net(degrad_patch)
+        restored, ratio_loss = self.net(degrad_patch, training = True)
 
-        loss = self.loss_fn(restored,clean_patch)
+        loss = self.loss_fn(restored,clean_patch)  + ratio_loss
         # Logging to TensorBoard (if installed) by default
         self.log("train_loss", loss)
         return loss
@@ -49,36 +69,33 @@ class PromptUformerIRModel(pl.LightningModule):
 
         return [optimizer],[scheduler] 
 
-class PromptIRModel(pl.LightningModule):
-    def __init__(self):
-        super().__init__()
-        self.net = PromptIR(decoder=True)
-        self.loss_fn  = nn.L1Loss()
-    
-    def forward(self,x):
-        return self.net(x)
-    
-    def training_step(self, batch, batch_idx):
-        # training_step defines the train loop.
-        # it is independent of forward
-        ([clean_name, de_id], degrad_patch, clean_patch) = batch
-        restored = self.net(degrad_patch)
+def evaluate_model(net, opt, logger):
+    denoise_splits = "bsd68/"
+    derain_splits = "Rain100L/"
 
-        loss = self.loss_fn(restored,clean_patch)
-        # Logging to TensorBoard (if installed) by default
-        self.log("train_loss", loss)
-        return loss
-    
-    def lr_scheduler_step(self,scheduler,metric):
-        scheduler.step(self.current_epoch)
-        lr = scheduler.get_lr()
-    
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=2e-4)
-        scheduler = LinearWarmupCosineAnnealingLR(optimizer=optimizer,warmup_epochs=15,max_epochs=150)
+    denoise_testset = DenoiseTestDataset(opt)
 
-        return [optimizer],[scheduler]
+    print(f'Start {denoise_splits} testing Sigma=15...')
+    psnr_denoise_15, ssim_denoise_15  = test_Denoise(opt, net, denoise_testset, sigma=15)
+    logger.log_metrics({"PSNR_Denoise_15":psnr_denoise_15,"SSIM_Denoise_15":ssim_denoise_15})
 
+    print(f'Start {denoise_splits} testing Sigma=25...')
+    psnr_denoise_25, ssim_denoise_25 = test_Denoise(opt, net, denoise_testset, sigma=25)
+    logger.log_metrics({"PSNR_Denoise_25":psnr_denoise_25,"SSIM_Denoise_25":ssim_denoise_25})
+
+    print(f'Start {denoise_splits} testing Sigma=50...')
+    psnr_denoise_50, ssim_denoise_50 = test_Denoise(opt, net, denoise_testset, sigma=50)
+    logger.log_metrics({"PSNR_Denoise_50":psnr_denoise_50,"SSIM_Denoise_50":ssim_denoise_50})
+
+
+    print(f'Start testing {derain_splits} rain streak removal...')
+    derain_set = DerainDehazeDataset(opt, addnoise=False, sigma=15)
+    psnr_derain, ssim_derain = test_Derain_Dehaze(opt, net, derain_set, task="derain")
+    logger.log_metrics({"PSNR_Derain":psnr_derain,"SSIM_Derain":ssim_derain})
+
+    print('Start testing SOTS...')
+    psnr_dehaze, ssim_dehaze = test_Derain_Dehaze(opt, net, derain_set, task="dehaze")
+    logger.log_metrics({"PSNR_Dehaze":psnr_dehaze,"SSIM_Dehaze":ssim_dehaze})
 
 
 def test_Denoise(testopt, net, dataset, sigma=15):
@@ -102,10 +119,9 @@ def test_Denoise(testopt, net, dataset, sigma=15):
             w_pad = (W_old // 64 + 1) * 64 - W_old
             degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [2])], 2)[:,:,:H_old+h_pad,:]
             degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [3])], 3)[:,:,:,:W_old+w_pad]
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [2])], 2)[:,:,:512,:]
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [3])], 3)[:,:,:,:512]
-            
-            restored = net(degrad_patch)
+
+            #restored = net(degrad_patch)
+            restored = net(degrad_patch, training = False)
             restored = restored[:,:,:H_old,:W_old]
             temp_psnr, temp_ssim, N = compute_psnr_ssim(restored, clean_patch)
 
@@ -134,24 +150,14 @@ def test_Derain_Dehaze(testopt, net, dataset, task="derain"):
 
              # degrad_patch must be mutipler of 64
             _, _, H_old, W_old = degrad_patch.shape
-            # max_dim = max(H_old, W_old)
-            # new_size = ((max_dim // 128) + (max_dim % 128 > 0)) * 128
-            # pad_H = new_size - H_old  # Padding for bottom
-            # pad_W = new_size - W_old  # Padding for right
-            # degrad_patch = F.pad(degrad_patch, (0, pad_W, 0, pad_H), mode='constant', value=0)
-            
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [2])], 2)[:,:,:old+pad,:]
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [3])], 3)[:,:,:,:old+pad]
             
             h_pad = (H_old // 64 + 1) * 64 - H_old
             w_pad = (W_old // 64 + 1) * 64 - W_old
             degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [2])], 2)[:,:,:H_old+h_pad,:]
             degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [3])], 3)[:,:,:,:W_old+w_pad]
-            
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [2])], 2)[:,:,:768,:]
-            # degrad_patch = torch.cat([degrad_patch, torch.flip(degrad_patch, [3])], 3)[:,:,:,:768]
-            
-            restored = net(degrad_patch)
+
+            #restored = net(degrad_patch)
+            restored = net(degrad_patch,training = False)
             restored = restored[:,:,:H_old:,:W_old]
 
             temp_psnr, temp_ssim, N = compute_psnr_ssim(restored, clean_patch)
@@ -168,14 +174,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # Input Parameters
     parser.add_argument('--cuda', type=int, default=0)
-    parser.add_argument('--mode', type=int, default=2,
+    parser.add_argument('--mode', type=int, default=3,
                         help='0 for denoise, 1 for derain, 2 for dehaze, 3 for all-in-one')
 
     parser.add_argument('--denoise_path', type=str, default="/data/jiachen/all_in_one/Test/denoise/", help='save path of test noisy images')
     parser.add_argument('--derain_path', type=str, default="/data/jiachen/all_in_one/Test/derain/", help='save path of test raining images')
     parser.add_argument('--dehaze_path', type=str, default="/data/jiachen/all_in_one/Test/dehaze/", help='save path of test hazy images')
-    parser.add_argument('--output_path', type=str, default="output/", help='output save path')
-    parser.add_argument('--ckpt_name', type=str, default="/home/jiachen/PromptIR/promptuformer/train_ckpt/epoch=26-step=120177.ckpt", help='checkpoint save path')
+    parser.add_argument('--output_path', type=str, default="output_ca_eff_infer/", help='output save path')
+    parser.add_argument('--ckpt_name', type=str, default="/home/jiachen/PromptIR/ckpt/epoch=51-step=617188.ckpt", help='checkpoint save path')
     testopt = parser.parse_args()
     
     
@@ -204,7 +210,7 @@ if __name__ == '__main__':
 
     print("CKPT name : {}".format(ckpt_path))
 
-    net  = PromptUformerIRModel().load_from_checkpoint(ckpt_path).cuda()
+    net  = CAPromptXRestormerEffv2IRModel().cuda()#.load_from_checkpoint(ckpt_path).cuda()
     net.eval()
 
     
