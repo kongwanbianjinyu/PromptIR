@@ -547,8 +547,19 @@ if __name__ == "__main__":
         )
     
     # torchstat
-    x = torch.randn(1, 3, 512, 128)
-    y = model(x)
-    print(y.shape)
-    print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model.parameters())/ 1e6))
-    # stat(model, (3, 512, 512))
+    # x = torch.randn(1, 3, 512, 128)
+    # y = model(x)
+    # print(y.shape)
+    # print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model.parameters())/ 1e6))
+    # # stat(model, (3, 512, 512))
+
+    from utils_modelsummary import get_model_activation, get_model_flops
+    with torch.no_grad():
+        input_dim = (3, 64, 64)  # set the input dimension
+        activations, num_conv2d = get_model_activation(model, input_dim)
+        print('{:>16s} : {:<.4f} [M]'.format('#Activations', activations/10**6))
+        print('{:>16s} : {:<d}'.format('#Conv2d', num_conv2d))
+        flops = get_model_flops(model, input_dim, False)
+        print('{:>16s} : {:<.4f} [G]'.format('FLOPs', flops/10**9))
+        num_parameters = sum(map(lambda x: x.numel(), model.parameters()))
+        print('{:>16s} : {:<.4f} [M]'.format('#Params', num_parameters/10**6))

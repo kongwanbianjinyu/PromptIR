@@ -381,14 +381,26 @@ class PromptIR(nn.Module):
 
 
 if __name__ == "__main__":
-    input_size = 392
-    model_restoration = PromptIR(inp_channels=3, out_channels=3, dim=48, num_blocks=[4,6,6,8], 
+    #input_size = 392
+    model = PromptIR(inp_channels=3, out_channels=3, dim=48, num_blocks=[4,6,6,8], 
                                   num_refinement_blocks=4, heads=[1,2,4,8], ffn_expansion_factor=2.66, 
                                   bias=False, LayerNorm_type='WithBias', decoder = True)
 
-    x = torch.randn(1, 3, 128, 128)
-    out = model_restoration(x)
-    print(out.shape)
+    # x = torch.randn(1, 3, 128, 128)
+    # out = model_restoration(x)
+    # print(out.shape)
 
-    print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model_restoration.parameters())/ 1e6))
+    # print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model_restoration.parameters())/ 1e6))
+    from utils_modelsummary import get_model_activation, get_model_flops
+    with torch.no_grad():
+        input_dim = (3, 64, 64)  # set the input dimension
+        activations, num_conv2d = get_model_activation(model, input_dim)
+        print('{:>16s} : {:<.4f} [M]'.format('#Activations', activations/10**6))
+        print('{:>16s} : {:<d}'.format('#Conv2d', num_conv2d))
+        flops = get_model_flops(model, input_dim, False)
+        print('{:>16s} : {:<.4f} [G]'.format('FLOPs', flops/10**9))
+        num_parameters = sum(map(lambda x: x.numel(), model.parameters()))
+        print('{:>16s} : {:<.4f} [M]'.format('#Params', num_parameters/10**6))
+
+    
 

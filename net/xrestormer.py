@@ -148,6 +148,19 @@ class FeedForward(nn.Module):
         x = F.gelu(x1) * x2
         x = self.project_out(x)
         return x
+    
+    def compute_flops(self, x):
+        N,C,H,W = x.shape
+        hidden_features = int(C*2.66)
+        # project_in
+        project_in_flops = C * 2*hidden_features * H * W
+        # dwconv
+        dwconv_flops = hidden_features * 2 * H * W * 9
+        # project_out
+        project_out_flops = hidden_features * C * H * W
+        flops = project_in_flops + dwconv_flops + project_out_flops
+
+        return flops
 
 
 ##########################################################################
@@ -184,6 +197,18 @@ class ChannelAttention(nn.Module):
 
         out = self.project_out(out)
         return out
+    
+    def compute_flops(self, x):
+        N,C,H,W = x.shape
+        proj_qkv_flops = C * 3 * C * H * W
+        dwconv_flops = C * 3 * H * W * 9
+        project_out_flops = C * C * H * W
+
+        attn_matmul_flops = 2 * C * C * H * W
+        attn_out_flops = C * C * H * W
+
+        flops = proj_qkv_flops + dwconv_flops + project_out_flops + attn_matmul_flops + attn_out_flops
+        return flops
 
 ##########################################################################
 ## Overlapping Cross-Attention (OCA)
@@ -234,6 +259,29 @@ class OCAB(nn.Module):
         out = self.project_out(out)
 
         return out
+    
+    def compute_flops(self, x):
+        N,C,H,W = x.shape
+        # proj_qkv
+        proj_qkv_flops = 2 * C * 3* self.inner_dim * H * W
+
+        # hard attn
+        hard_attn_flops = 0
+        h, w = H//self.window_size, W//self.window_size
+        p = self.window_size
+        p2 = self.overlap_win_size
+        # qs = qs * self.scale
+        # spatial_attn = (qs @ ks.transpose(-2, -1))
+        hard_attn_flops += (H * W * C + h * w * p**2 * self.inner_dim * p2**2)
+        # spatial_attn += self.rel_pos_emb(qs)
+        hard_attn_flops += h * w * p**2 * p2**2  
+        # v_out_hard = (spatial_attn @ vs)
+        hard_attn_flops +=  h * w * p**2 * self.inner_dim * p2**2    
+        # proj_out
+        proj_out_flops = self.inner_dim * C * H * W
+        flops = proj_qkv_flops + hard_attn_flops + proj_out_flops
+        return flops
+    
 
 ##########################################################################
 class TransformerBlock(nn.Module):
@@ -259,6 +307,24 @@ class TransformerBlock(nn.Module):
         x = x + self.spatial_attn(self.norm3(x))
         x = x + self.spatial_ffn(self.norm4(x))
         return x
+    
+    def compute_flops(self, x):
+        N,C,H,W = x.shape
+        # channel_attn
+        channel_attn_flops = self.channel_attn.compute_flops(x)
+        # channel_ffn
+        channel_ffn_flops = self.channel_ffn.compute_flops(x)
+        # spatial_attn
+        spatial_attn_flops = self.spatial_attn.compute_flops(x)
+        # spatial_ffn
+        spatial_ffn_flops = self.spatial_ffn.compute_flops(x)
+        flops = channel_attn_flops + channel_ffn_flops + spatial_attn_flops + spatial_ffn_flops
+        print("channel_attn_flops",channel_attn_flops)  
+        print("channel_ffn_flops",channel_ffn_flops)
+        print("spatial_attn_flops",spatial_attn_flops)
+        print("spatial_ffn_flops",spatial_ffn_flops)
+        print("\n")
+        return flops
 
 ##########################################################################
 ## Overlapped image patch embedding with 3x3 Conv
@@ -408,6 +474,35 @@ class XRestormer(nn.Module):
         out_dec_level1 = self.output(out_dec_level1) + inp_img
 
         return out_dec_level1
+    
+    def compute_flops(self, x):
+        N,C,H,W = x.shape
+        x_level1 = self.patch_embed(x)
+        x_level2 = self.down1_2(x_level1)
+        x_level3 = self.down2_3(x_level2)
+        x_level4 = self.down3_4(x_level3)
+        # patch_embed
+        patch_embed_flops = 3 * H * W * C * 3 * 3 * 48
+        # encoder_level1
+        encoder_level1_flops = self.encoder_level1[0].compute_flops(x_level1)*len(self.encoder_level1)
+        # encoder_level2
+        encoder_level2_flops = self.encoder_level2[0].compute_flops(x_level2)*len(self.encoder_level2)
+        # encoder_level3
+        encoder_level3_flops = self.encoder_level3[0].compute_flops(x_level3)*len(self.encoder_level3)
+        # latent
+        latent_flops = self.latent[0].compute_flops(x_level4)*len(self.latent)
+        # decoder_level3
+        decoder_level3_flops = self.decoder_level3[0].compute_flops(x_level3)*len(self.decoder_level3)
+        # decoder_level2
+        decoder_level2_flops = self.decoder_level2[0].compute_flops(x_level2)*len(self.decoder_level2)
+        # decoder_level1
+        decoder_level1_flops = self.decoder_level1[0].compute_flops(x_level1)*len(self.decoder_level1)
+        # refinement
+        refinement_flops = self.refinement[0].compute_flops(x_level1)*len(self.refinement)
+        # output
+        output_flops = 3 * H * W * 48 * C
+        flops = patch_embed_flops + encoder_level1_flops + encoder_level2_flops + encoder_level3_flops + latent_flops + decoder_level3_flops + decoder_level2_flops + decoder_level1_flops + refinement_flops+ output_flops
+        return flops
 
 if __name__ == "__main__":
     model = XRestormer(
@@ -424,7 +519,23 @@ if __name__ == "__main__":
         LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
         dual_pixel_task = False,        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
         scale = 1,
-        )
-
+        ).cuda()
+    print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model.parameters())/ 1e6))
     # torchstat
-    stat(model, (3, 512, 512))
+    #x = torch.randn(1, 3, 64, 64)
+    # y = model(x)
+    # # compute flops 
+    # flops = model.compute_flops(x)
+    # print(f'FLOPs: {flops}')
+
+    #model = Restormer().cuda()
+    from utils_modelsummary import get_model_activation, get_model_flops
+    with torch.no_grad():
+        input_dim = (3, 64, 64)  # set the input dimension
+        activations, num_conv2d = get_model_activation(model, input_dim)
+        print('{:>16s} : {:<.4f} [M]'.format('#Activations', activations/10**6))
+        print('{:>16s} : {:<d}'.format('#Conv2d', num_conv2d))
+        flops = get_model_flops(model, input_dim, False)
+        print('{:>16s} : {:<.4f} [G]'.format('FLOPs', flops/10**9))
+        num_parameters = sum(map(lambda x: x.numel(), model.parameters()))
+        print('{:>16s} : {:<.4f} [M]'.format('#Params', num_parameters/10**6))

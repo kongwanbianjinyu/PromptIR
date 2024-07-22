@@ -164,11 +164,16 @@ class FeedForward(nn.Module):
         return flops
 
 
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
 ##########################################################################
 ## Multi-DConv Head Transposed Self-Attention (MDTA)
-class ChannelAttention(nn.Module):
+class CAChannelAttention(nn.Module):
     def __init__(self, dim, num_heads, bias):
-        super(ChannelAttention, self).__init__()
+        super(CAChannelAttention, self).__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
@@ -176,25 +181,96 @@ class ChannelAttention(nn.Module):
         self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
-    def forward(self, x):
+        dw_channel = dim * 2
+        self.conv1 = nn.Conv2d(in_channels=dim, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel,
+                               bias=True)
+        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        
+        
+        # Simplified Channel Attention
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1,
+                      groups=1, bias=True),
+        )
+
+        # SimpleGate
+        self.sg = SimpleGate()
+
+        self.predictor = Predictor()
+
+    def forward(self, x, global_condition=None, training = False):
+
+        
         b,c,h,w = x.shape
 
-        qkv = self.qkv_dwconv(self.qkv(x))
-        q,k,v = qkv.chunk(3, dim=1)
+        mask = self.predictor(x, training=training)
+        if training:
+            qkv = self.qkv_dwconv(self.qkv(x))
+            q,k,v = qkv.chunk(3, dim=1)
+            q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
 
-        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            q = torch.nn.functional.normalize(q, dim=-1)
+            k = torch.nn.functional.normalize(k, dim=-1)
 
-        q = torch.nn.functional.normalize(q, dim=-1)
-        k = torch.nn.functional.normalize(k, dim=-1)
+            attn = (q @ k.transpose(-2, -1)) * self.temperature
+            attn = attn.softmax(dim=-1)
 
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
+            out = (attn @ v)
 
-        out = (attn @ v)
+            out_hard = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
-        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+            x = self.conv1(x)
+            x = self.conv2(x)
+            x = self.sg(x)
+            x = x * self.sca(x)
+            x = self.conv3(x)
+            out_easy = x
+
+
+            out = out_hard*mask + out_easy*(1-mask)
+
+        else:
+            idx1, idx2 = mask
+            x_hard = image_index_select(x, idx1)
+            qkv = self.qkv_dwconv(self.qkv(x_hard))
+            q,k,v = qkv.chunk(3, dim=1)
+            
+            q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+            v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+            q = torch.nn.functional.normalize(q, dim=-1)
+            k = torch.nn.functional.normalize(k, dim=-1)
+
+            attn = (q @ k.transpose(-2, -1)) * self.temperature
+            attn = attn.softmax(dim=-1)
+
+            out = (attn @ v)
+
+            out_hard = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+
+            x_easy = image_index_select(x, idx2)
+
+            x = self.conv1(x_easy)
+            x = self.conv2(x)
+            x = self.sg(x)
+            x = x * self.sca(x)
+            x = self.conv3(x)
+            out_easy = x
+
+            out = image_index_fill(out, out_easy, idx1, idx2)
+
+        return out
+
+
+    
+
+
+
 
         out = self.project_out(out)
         return out
@@ -456,38 +532,37 @@ class CAMixer(nn.Module):
         # easy attn
         v_out_easy = vs*sa
         # #print("mask", mask)
-        # if training:
-        #     # spatial attention
-        #     qs = rearrange(qs, 'b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1 = self.window_size, p2 = self.window_size)
-        #     ks, vs = map(lambda t: self.unfold(t), (ks, vs))
-        #     ks, vs = map(lambda t: rearrange(t, 'b (c j) i -> (b i) j c', c = self.inner_dim), (ks, vs))
+        if training:
+            # spatial attention
+            qs = rearrange(qs, 'b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1 = self.window_size, p2 = self.window_size)
+            ks, vs = map(lambda t: self.unfold(t), (ks, vs))
+            ks, vs = map(lambda t: rearrange(t, 'b (c j) i -> (b i) j c', c = self.inner_dim), (ks, vs))
 
-        #     # print(f'qs.shape:{qs.shape}, ks.shape:{ks.shape}, vs.shape:{vs.shape}')
-        #     #split heads
-        #     qs, ks, vs = map(lambda t: rearrange(t, 'b n (head c) -> (b head) n c', head = self.num_heads), (qs, ks, vs))
+            # print(f'qs.shape:{qs.shape}, ks.shape:{ks.shape}, vs.shape:{vs.shape}')
+            #split heads
+            qs, ks, vs = map(lambda t: rearrange(t, 'b n (head c) -> (b head) n c', head = self.num_heads), (qs, ks, vs))
 
-        #     # attention
-        #     qs = qs * self.scale
-        #     spatial_attn = (qs @ ks.transpose(-2, -1))
-        #     spatial_attn += self.rel_pos_emb(qs)
-        #     spatial_attn = spatial_attn.softmax(dim=-1)
+            # attention
+            qs = qs * self.scale
+            spatial_attn = (qs @ ks.transpose(-2, -1))
+            spatial_attn += self.rel_pos_emb(qs)
+            spatial_attn = spatial_attn.softmax(dim=-1)
 
-        #     v_out_hard = (spatial_attn @ vs)
-        #     v_out_hard = rearrange(v_out_hard, '(b h w head) (p1 p2) c -> b (head c) (h p1) (w p2)', head = self.num_heads, h = H // self.window_size, w = W // self.window_size, p1 = self.window_size, p2 = self.window_size)
+            v_out_hard = (spatial_attn @ vs)
+            v_out_hard = rearrange(v_out_hard, '(b h w head) (p1 p2) c -> b (head c) (h p1) (w p2)', head = self.num_heads, h = H // self.window_size, w = W // self.window_size, p1 = self.window_size, p2 = self.window_size)
 
-        #     v_out_easy = rearrange(v_out_easy,'b c (h dh) (w dw) -> b (h w) (dh dw c)', dh=self.window_size, dw=self.window_size)
-        #     v_out_hard = rearrange(v_out_hard,'b c (h dh) (w dw) -> b (h w) (dh dw c)', dh=self.window_size, dw=self.window_size)
+            v_out_easy = rearrange(v_out_easy,'b c (h dh) (w dw) -> b (h w) (dh dw c)', dh=self.window_size, dw=self.window_size)
+            v_out_hard = rearrange(v_out_hard,'b c (h dh) (w dw) -> b (h w) (dh dw c)', dh=self.window_size, dw=self.window_size)
         
             
-        #     out = v_out_hard*mask + v_out_easy*(1-mask) 
+            out = v_out_hard*mask + v_out_easy*(1-mask) 
                 
-        #     out = rearrange(out, 'b (h w) (dh dw c) -> b c (h dh) (w dw)', dh=self.window_size, dw=self.window_size,h = H // self.window_size, w = W // self.window_size)
-        #     out = self.project_out(out)
+            out = rearrange(out, 'b (h w) (dh dw c) -> b c (h dh) (w dw)', dh=self.window_size, dw=self.window_size,h = H // self.window_size, w = W // self.window_size)
+            out = self.project_out(out)
             
-        #     return out, torch.mean(mask,dim=1)
+            return out, torch.mean(mask,dim=1)
             
-        # else:
-        if True:
+        else:
             qs = rearrange(qs, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = self.window_size, p2 = self.window_size)
             ks, vs = map(lambda t: self.unfold(t), (ks, vs))
             ks, vs = map(lambda t: rearrange(t, 'b (c j) i -> b i (j c)', c = self.inner_dim), (ks, vs))
@@ -557,7 +632,7 @@ class CATransformerBlock(nn.Module):
 
         #self.spatial_attn = OCAB(dim, window_size, overlap_ratio, num_spatial_heads, spatial_dim_head, bias)
         self.spatial_attn = CAMixer(dim,window_size=window_size,ratio=ratio,num_heads = num_heads, dim_head = dim_head,overlap_ratio = overlap_ratio)
-        self.channel_attn = ChannelAttention(dim, num_channel_heads, bias)
+        self.channel_attn = CAChannelAttention(dim, num_channel_heads, bias)
 
         self.norm1 = RestormerLayerNorm(dim, LayerNorm_type)
         self.norm2 = RestormerLayerNorm(dim, LayerNorm_type)
