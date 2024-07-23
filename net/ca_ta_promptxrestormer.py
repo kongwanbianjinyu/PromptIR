@@ -131,9 +131,9 @@ class RestormerLayerNorm(nn.Module):
 
 ##########################################################################
 ## Gated-Dconv Feed-Forward Network (GDFN)
-class FeedForward(nn.Module):
+class HardFeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
-        super(FeedForward, self).__init__()
+        super(HardFeedForward, self).__init__()
 
         hidden_features = int(dim*ffn_expansion_factor)
 
@@ -150,18 +150,40 @@ class FeedForward(nn.Module):
         x = self.project_out(x)
         return x
     
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        hidden_features = int(C*2.66)
-        # project_in
-        project_in_flops = C * 2*hidden_features * H * W
-        # dwconv
-        dwconv_flops = hidden_features * 2 * H * W * 9
-        # project_out
-        project_out_flops = hidden_features * C * H * W
-        flops = project_in_flops + dwconv_flops + project_out_flops
+def round_to_nearest_power_of_2(x):
+    if x & (x - 1) == 0:  # Step 1: Check if x is already a power of 2
+        return x
+    msb_pos = x.bit_length() - 1  # Step 2: Find MSB position
+    lower_bound = 1 << msb_pos  # Step 3: Calculate lower bound
+    upper_bound = 1 << (msb_pos + 1)  # Step 4: Calculate upper bound
+    midpoint = (upper_bound + lower_bound) // 2  # Calculate midpoint
+    if x < midpoint:  # Step 5 & 6: Compare and decide to round down or up
+        return lower_bound
+    else:
+        return upper_bound
+    
+##########################################################################
+## Gated-Dconv Feed-Forward Network (GDFN)
+class EasyFeedForward(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(EasyFeedForward, self).__init__()
 
-        return flops
+        ffn_channel = int(ffn_expansion_factor * dim)
+        ffn_channel = round_to_nearest_power_of_2(ffn_channel)
+        #print("FFN Channel: ", ffn_channel)
+        self.conv1 = nn.Conv2d(in_channels=dim, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=dim, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+
+        self.sg = SimpleGate()
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+
+        x = self.conv1(x)
+        x = self.sg(x)
+        x = self.conv2(x)
+        x = self.project_out(x)
+        return x
 
 
 class SimpleGate(nn.Module):
@@ -169,173 +191,6 @@ class SimpleGate(nn.Module):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
-##########################################################################
-## Multi-DConv Head Transposed Self-Attention (MDTA)
-class CAChannelAttention(nn.Module):
-    def __init__(self, dim, num_heads, bias):
-        super(CAChannelAttention, self).__init__()
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-
-        self.qkv = nn.Conv2d(dim, dim*3, kernel_size=1, bias=bias)
-        self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
-        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
-
-        dw_channel = dim * 2
-        self.conv1 = nn.Conv2d(in_channels=dim, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
-        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel,
-                               bias=True)
-        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
-        
-        
-        # Simplified Channel Attention
-        self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1,
-                      groups=1, bias=True),
-        )
-
-        # SimpleGate
-        self.sg = SimpleGate()
-
-        self.predictor = Predictor()
-
-    def forward(self, x, global_condition=None, training = False):
-
-        
-        b,c,h,w = x.shape
-
-        mask = self.predictor(x, training=training)
-        if training:
-            qkv = self.qkv_dwconv(self.qkv(x))
-            q,k,v = qkv.chunk(3, dim=1)
-            q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-            k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-            v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-
-            q = torch.nn.functional.normalize(q, dim=-1)
-            k = torch.nn.functional.normalize(k, dim=-1)
-
-            attn = (q @ k.transpose(-2, -1)) * self.temperature
-            attn = attn.softmax(dim=-1)
-
-            out = (attn @ v)
-
-            out_hard = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
-
-            x = self.conv1(x)
-            x = self.conv2(x)
-            x = self.sg(x)
-            x = x * self.sca(x)
-            x = self.conv3(x)
-            out_easy = x
-
-
-            out = out_hard*mask + out_easy*(1-mask)
-
-        else:
-            idx1, idx2 = mask
-            x_hard = image_index_select(x, idx1)
-            qkv = self.qkv_dwconv(self.qkv(x_hard))
-            q,k,v = qkv.chunk(3, dim=1)
-            
-            q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-            k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-            v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-
-            q = torch.nn.functional.normalize(q, dim=-1)
-            k = torch.nn.functional.normalize(k, dim=-1)
-
-            attn = (q @ k.transpose(-2, -1)) * self.temperature
-            attn = attn.softmax(dim=-1)
-
-            out = (attn @ v)
-
-            out_hard = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
-
-            x_easy = image_index_select(x, idx2)
-
-            x = self.conv1(x_easy)
-            x = self.conv2(x)
-            x = self.sg(x)
-            x = x * self.sca(x)
-            x = self.conv3(x)
-            out_easy = x
-
-            out = image_index_fill(out, out_easy, idx1, idx2)
-
-        return out
-
-
-    
-
-
-
-
-        out = self.project_out(out)
-        return out
-    
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        proj_qkv_flops = C * 3 * C * H * W
-        dwconv_flops = C * 3 * H * W * 9
-        project_out_flops = C * C * H * W
-
-        attn_matmul_flops = 2 * C * C * H * W
-        attn_out_flops = C * C * H * W
-
-        flops = proj_qkv_flops + dwconv_flops + project_out_flops + attn_matmul_flops + attn_out_flops
-        return flops
-        
-##########################################################################
-## Overlapping Cross-Attention (OCA)
-class OCAB(nn.Module):
-    def __init__(self, dim, window_size, overlap_ratio, num_heads, dim_head, bias):
-        super(OCAB, self).__init__()
-        self.num_spatial_heads = num_heads
-        self.dim = dim
-        self.window_size = window_size
-        self.overlap_win_size = int(window_size * overlap_ratio) + window_size
-        self.dim_head = dim_head
-        self.inner_dim = self.dim_head * self.num_spatial_heads
-        self.scale = self.dim_head**-0.5
-
-        self.unfold = nn.Unfold(kernel_size=(self.overlap_win_size, self.overlap_win_size), stride=window_size, padding=(self.overlap_win_size-window_size)//2)
-        self.qkv = nn.Conv2d(self.dim, self.inner_dim*3, kernel_size=1, bias=bias)
-        self.project_out = nn.Conv2d(self.inner_dim, dim, kernel_size=1, bias=bias)
-        self.rel_pos_emb = RelPosEmb(
-            block_size = window_size,
-            rel_size = window_size + (self.overlap_win_size - window_size),
-            dim_head = self.dim_head
-        )
-    def forward(self, x):
-        b, c, h, w = x.shape
-        qkv = self.qkv(x)
-        qs, ks, vs = qkv.chunk(3, dim=1)
-
-        # spatial attention
-        qs = rearrange(qs, 'b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1 = self.window_size, p2 = self.window_size)
-        ks, vs = map(lambda t: self.unfold(t), (ks, vs))
-        ks, vs = map(lambda t: rearrange(t, 'b (c j) i -> (b i) j c', c = self.inner_dim), (ks, vs))
-
-        # print(f'qs.shape:{qs.shape}, ks.shape:{ks.shape}, vs.shape:{vs.shape}')
-        #split heads
-        qs, ks, vs = map(lambda t: rearrange(t, 'b n (head c) -> (b head) n c', head = self.num_spatial_heads), (qs, ks, vs))
-
-        # attention
-        qs = qs * self.scale
-        spatial_attn = (qs @ ks.transpose(-2, -1))
-        spatial_attn += self.rel_pos_emb(qs)
-        spatial_attn = spatial_attn.softmax(dim=-1)
-
-        out = (spatial_attn @ vs)
-
-        out = rearrange(out, '(b h w head) (p1 p2) c -> b (head c) (h p1) (w p2)', head = self.num_spatial_heads, h = h // self.window_size, w = w // self.window_size, p1 = self.window_size, p2 = self.window_size)
-
-        # merge spatial and channel
-        out = self.project_out(out)
-
-        return out
 def batch_index_select(x, idx):
     if len(x.size()) == 3:
         B, N, C = x.size()
@@ -370,6 +225,7 @@ def batch_index_fill(x, x1, x2, idx1, idx2):
 
     x = x.reshape(B, N, C)
     return x
+
 
 
 class LayerNorm(nn.Module):
@@ -457,24 +313,48 @@ class PredictorLG(nn.Module):
             idx2 = idx[:, num_keep_node:]
             return [idx1, idx2], sa
 
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        C = C + 4
-        p = self.window_size
-        h, w = H//p, W//p
-        # in_conv
-        in_conv_flops = C * C//4 * H * W
 
-        # out_mask
-        linear1_flops = h * w * p**3
-        linear2_flops = 2* h * w * p
+class BranchSelector(nn.Module):
+    def __init__(self, dim, hard_ratio = 0.5):
+        super(BranchSelector, self).__init__()
+        self.dim = dim
+        self.hard_ratio = hard_ratio
 
-        # out_SA
-        out_SA_flops = C//4 * H * W * 9
+        self.in_conv = nn.Sequential(
+            nn.Conv2d(dim, dim//4, 1),
+            LayerNorm(dim//4),
+            nn.LeakyReLU(negative_slope=0.1, inplace=True),
+        )
 
-        flops = in_conv_flops + linear1_flops + linear2_flops + out_SA_flops
 
-        return flops
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim//4, dim//4, 1, bias=False),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(dim//4, dim//4, 1, bias=False),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(dim//4, 1),
+            nn.Sigmoid()
+            )
+        
+
+    def forward(self, x,  training = False):
+        N, C, H, W = x.shape
+        x = self.in_conv(x)
+        x = self.se(x)
+        x = x.mean([2, 3])
+        label = self.classifier(x) #[B, 1]
+        label = F.gumbel_softmax(label, hard=True, dim=0).squeeze(1)
+        if training:
+            return label
+        else:
+            num_keep_node = min(int(N * self.hard_ratio), N)
+            idx = torch.argsort(label, descending=True)
+            idx1 = idx[:num_keep_node]
+            idx2 = idx[num_keep_node:]
+            return [idx1, idx2]
 
 class CAMixer(nn.Module):
     def __init__(self, dim, window_size=8, bias=True, is_deformable=True, num_heads = 4, dim_head = 16,overlap_ratio = 0.5,  ratio=0.5):
@@ -577,7 +457,7 @@ class CAMixer(nn.Module):
             qs, ks, vs = map(lambda t: rearrange(t, 'b n (head c) -> (b head) n c', head = self.num_heads), (qs, ks, vs))
 
             # attention
-            print(f'qs.shape:{qs.shape}, ks.shape:{ks.shape}, vs.shape:{vs.shape}')
+            #print(f'qs.shape:{qs.shape}, ks.shape:{ks.shape}, vs.shape:{vs.shape}')
             qs = qs * self.scale
             spatial_attn = (qs @ ks.transpose(-2, -1))
             spatial_attn += self.rel_pos_emb(qs)
@@ -596,87 +476,146 @@ class CAMixer(nn.Module):
 
         return out
 
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        # proj_qkv
-        proj_qkv_flops = 2 * C * 3* self.inner_dim * H * W
 
-        # predictor
-        predictor_flops = self.route.compute_flops(x)
+##########################################################################
+## Multi-DConv Head Transposed Self-Attention (MDTA)
+class HardChannelAttention(nn.Module):
+    def __init__(self, dim, num_heads, bias):
+        super(HardChannelAttention, self).__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
 
-        # easy attn
-        easy_attn_flops = C * H * W
+        self.qkv = nn.Conv2d(dim, dim*3, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
 
-        # hard attn
-        hard_attn_flops = 0
-        h, w = H//self.window_size, W//self.window_size
-        p = self.window_size
-        p2 = self.overlap_win_size
-        # qs = qs * self.scale
-        # spatial_attn = (qs @ ks.transpose(-2, -1))
-        hard_attn_flops += self.ratio*(H * W * C + h * w * p**2 * self.inner_dim * p2**2)
-        # spatial_attn += self.rel_pos_emb(qs)
-        hard_attn_flops += self.ratio* h * w * p**2 * p2**2  
-        # v_out_hard = (spatial_attn @ vs)
-        hard_attn_flops += self.ratio* h * w * p**2 * self.inner_dim * p2**2    
-        # proj_out
-        proj_out_flops = self.inner_dim * C * H * W
-        flops = proj_qkv_flops + predictor_flops + easy_attn_flops + hard_attn_flops + proj_out_flops
-        return flops
+    def forward(self, x):
+        b,c,h,w = x.shape
+
+        qkv = self.qkv_dwconv(self.qkv(x))
+        q,k,v = qkv.chunk(3, dim=1)
+
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+
+        out = (attn @ v)
+
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+
+        out = self.project_out(out)
+        return out
+
+def image_idx_fill(x1, x2, idx1, idx2):
+    B1 = x1.shape[0]
+    B2 = x2.shape[0]
+    B = B1 + B2
+    x_combined = torch.zeros(B, *x1.shape[1:], device=x1.device, dtype=x1.dtype)
+    x_combined[idx1] = x1
+    x_combined[idx2] = x2
+    return x_combined
+    
+##########################################################################
+## Multi-DConv Head Transposed Self-Attention (MDTA)
+class EasyChannelAttention(nn.Module):
+    def __init__(self, dim, num_channel_heads, bias):
+        super(EasyChannelAttention, self).__init__()
+        dw_channel = dim
+        self.conv1 = nn.Conv2d(in_channels=dim, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel,
+                               bias=True)
+        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=dim, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
         
+        # Simplified Channel Attention
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1,
+                      groups=1, bias=True),
+        )
+
+        # SimpleGate
+        self.sg = SimpleGate()
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.sg(x)
+        x = x * self.sca(x)
+        x = self.conv3(x)
+
+        out = self.project_out(x)
+        return out
+
+
 ##########################################################################
 class CATransformerBlock(nn.Module):
-    def __init__(self, dim, window_size, ratio, num_channel_heads,  ffn_expansion_factor, bias, LayerNorm_type, num_heads = 4, dim_head = 16, overlap_ratio = 0.5):
+    def __init__(self, dim, window_size, ratio, num_channel_heads,  ffn_expansion_factor, bias, LayerNorm_type, num_heads = 4, dim_head = 16, overlap_ratio = 0.5, hard_ratio = 0.5):
         super(CATransformerBlock, self).__init__()
 
-
-        #self.spatial_attn = OCAB(dim, window_size, overlap_ratio, num_spatial_heads, spatial_dim_head, bias)
         self.spatial_attn = CAMixer(dim,window_size=window_size,ratio=ratio,num_heads = num_heads, dim_head = dim_head,overlap_ratio = overlap_ratio)
-        self.channel_attn = CAChannelAttention(dim, num_channel_heads, bias)
+        self.hard_channel_attn = HardChannelAttention(dim, num_channel_heads, bias)
+        self.easy_channel_attn = EasyChannelAttention(dim, num_channel_heads, bias)
 
         self.norm1 = RestormerLayerNorm(dim, LayerNorm_type)
         self.norm2 = RestormerLayerNorm(dim, LayerNorm_type)
         self.norm3 = RestormerLayerNorm(dim, LayerNorm_type)
         self.norm4 = RestormerLayerNorm(dim, LayerNorm_type)
 
-        self.channel_ffn = FeedForward(dim, ffn_expansion_factor, bias)
-        self.spatial_ffn = FeedForward(dim, ffn_expansion_factor, bias)
+        self.hard_channel_ffn = HardFeedForward(dim, ffn_expansion_factor, bias)
+        self.hard_spatial_ffn = HardFeedForward(dim, ffn_expansion_factor, bias)
+
+        self.easy_channel_ffn = EasyFeedForward(dim, ffn_expansion_factor, bias)
+        self.easy_spatial_ffn = EasyFeedForward(dim, ffn_expansion_factor, bias)
+
+        self.branch_selector = BranchSelector(dim, hard_ratio = hard_ratio)
 
 
 
-    def forward(self, x, global_condition=None, training = False):
+    def forward(self, x, global_condition =None, training = False):
+        label = self.branch_selector(x, training=training)
         if training:
-            x = x + self.channel_attn(self.norm1(x))
-            x = x + self.channel_ffn(self.norm2(x))
-            y, decision = self.spatial_attn(self.norm3(x), global_condition, training=training)
-            x  = x + y
-            x = x + self.spatial_ffn(self.norm4(x))
-            return x, decision
-        else:
-            x = x + self.channel_attn(self.norm1(x))
-            x = x + self.channel_ffn(self.norm2(x))
-            x = x + self.spatial_attn(self.norm3(x), global_condition, training=training)
-            x = x + self.spatial_ffn(self.norm4(x))
-            return x
-    
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        # channel_attn
-        channel_attn_flops = self.channel_attn.compute_flops(x)
-        # channel_ffn
-        channel_ffn_flops = self.channel_ffn.compute_flops(x)
-        # spatial_attn
-        spatial_attn_flops = self.spatial_attn.compute_flops(x)
-        # spatial_ffn
-        spatial_ffn_flops = self.spatial_ffn.compute_flops(x)
-        flops = channel_attn_flops + channel_ffn_flops + spatial_attn_flops + spatial_ffn_flops
-        print("channel_attn_flops",channel_attn_flops)  
-        print("channel_ffn_flops",channel_ffn_flops)
-        print("spatial_attn_flops",spatial_attn_flops)
-        print("spatial_ffn_flops",spatial_ffn_flops)
-        print("\n")
-        return flops
+            y, decision = self.spatial_attn(self.norm1(x), global_condition, training=training)
+            x = x + y
 
+            x_hard = x + self.hard_spatial_ffn(self.norm2(x))
+            x_hard = x_hard + self.hard_channel_attn(self.norm3(x_hard))
+            x_hard = x_hard + self.hard_channel_ffn(self.norm4(x_hard))
+
+            x_easy = x + self.easy_spatial_ffn(self.norm2(x))
+            x_easy = x_easy + self.easy_channel_attn(self.norm3(x_easy))
+            x_easy = x_easy + self.easy_channel_ffn(self.norm4(x_easy))
+
+            label = label.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            x = x_hard * label + x_easy * (1-label)
+
+
+            return x, decision, torch.mean(label) 
+        else:
+            y = self.spatial_attn(self.norm1(x), global_condition, training=training)
+            x = x + y
+
+            idx1, idx2 = label
+            x_hard = torch.index_select(x, 0, idx1)
+            x_easy = torch.index_select(x, 0, idx2)
+
+            x_hard = x_hard + self.hard_spatial_ffn(self.norm2(x_hard))
+            x_hard = x_hard + self.hard_channel_attn(self.norm3(x_hard))
+            x_hard = x_hard + self.hard_channel_ffn(self.norm4(x_hard))
+
+            x_easy = x_easy + self.easy_spatial_ffn(self.norm2(x_easy))
+            x_easy = x_easy + self.easy_channel_attn(self.norm3(x_easy))
+            x_easy = x_easy + self.easy_channel_ffn(self.norm4(x_easy))
+
+            x = image_idx_fill(x_hard, x_easy, idx1, idx2)
+
+            return x
     
 
 ##########################################################################
@@ -684,11 +623,11 @@ class ChannelTransformerBlock(nn.Module):
     def __init__(self, dim, num_channel_heads, ffn_expansion_factor, bias, LayerNorm_type):
         super(ChannelTransformerBlock, self).__init__()
 
-        self.channel_attn = ChannelAttention(dim, num_channel_heads, bias)
+        self.channel_attn = EasyChannelAttention(dim, num_channel_heads, bias)
         self.norm1 = RestormerLayerNorm(dim, LayerNorm_type)
         self.norm2 = RestormerLayerNorm(dim, LayerNorm_type)
 
-        self.channel_ffn = FeedForward(dim, ffn_expansion_factor, bias)
+        self.channel_ffn = EasyFeedForward(dim, ffn_expansion_factor, bias)
 
     def forward(self, x):
         x = x + self.channel_attn(self.norm1(x))
@@ -754,47 +693,6 @@ class SR_Upsample(nn.Sequential):
         else:
             raise ValueError(f'scale {scale} is not supported. ' 'Supported scales: 2^n and 3.')
         super(SR_Upsample, self).__init__(*m)
-
-
-##---------- Prompt Module -----------------------
-class PromptBlock(nn.Module):
-    def __init__(self,  window_size, overlap_ratio, num_channel_heads, num_spatial_heads, 
-                 spatial_dim_head, ffn_expansion_factor, bias, LayerNorm_type,
-                 prompt_dim=128,prompt_len=5,prompt_size = 96,lin_dim = 192, 
-                ):
-        super(PromptBlock,self).__init__()
-
-        # prompt generation
-        self.prompt_param = nn.Parameter(torch.rand(1,prompt_len,prompt_dim,prompt_size,prompt_size))
-        self.linear_layer = nn.Linear(lin_dim,prompt_len)
-        self.conv3x3 = nn.Conv2d(prompt_dim,prompt_dim,kernel_size=3,stride=1,padding=1,bias=False)
-
-        # prompt interaction
-        self.attn = ChannelTransformerBlock(dim=lin_dim + prompt_dim, window_size = window_size, 
-                                     overlap_ratio=overlap_ratio,  num_channel_heads=num_channel_heads, 
-                                     num_spatial_heads=num_spatial_heads, spatial_dim_head = spatial_dim_head, 
-                                     ffn_expansion_factor=ffn_expansion_factor, bias=bias, 
-                                     LayerNorm_type=LayerNorm_type) 
-        self.conv = nn.Conv2d(prompt_dim+lin_dim,lin_dim,kernel_size=3,stride=1,padding=1,bias=False)
-        
-
-    def forward(self,x):
-        # input x shape is [B, HW, C]
-        B, C, H, W = x.shape
-        # prompt generation
-        emb = x.mean(dim=(-2,-1))
-        prompt_weights = F.softmax(self.linear_layer(emb),dim=1)
-        prompt = prompt_weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * self.prompt_param.unsqueeze(0).repeat(B,1,1,1,1,1).squeeze(1)
-        prompt = torch.sum(prompt,dim=1)
-        prompt = F.interpolate(prompt,(H,W),mode="bilinear", align_corners=True)
-        prompt = self.conv3x3(prompt)
-
-        # x shape [B, C + C_p, H, W]
-        x = torch.cat([x, prompt], 1)
-        x = self.attn(x)
-        x = self.conv(x)
-
-        return x
     
 ##---------- Prompt Gen Module -----------------------
 class PromptGenBlock(nn.Module):
@@ -819,28 +717,25 @@ class PromptGenBlock(nn.Module):
 
 
 class XRestormerLayer(nn.Module):
-    def __init__(self, dim, depth, window_size, ratio,  num_channel_heads, ffn_expansion_factor, bias, LayerNorm_type, num_heads, dim_head, overlap_ratio):
+    def __init__(self, dim, depth, window_size, ratio,  num_channel_heads, ffn_expansion_factor, bias, LayerNorm_type, num_heads, dim_head, overlap_ratio, hard_ratio):
         super(XRestormerLayer, self).__init__()
-        self.layer = nn.Sequential(*[CATransformerBlock(dim=dim, window_size = window_size, ratio = ratio, num_channel_heads=num_channel_heads,  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, num_heads = num_heads, dim_head = dim_head, overlap_ratio = overlap_ratio) for i in range(depth)])
+        self.layer = nn.Sequential(*[CATransformerBlock(dim=dim, window_size = window_size, ratio = ratio, num_channel_heads=num_channel_heads,  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, num_heads = num_heads, dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio=hard_ratio) for i in range(depth)])
 
     def forward(self, x, global_condition=None, training = False):
         if training:
             decision_avg = 0
+            hard_ratio_avg = 0
             for layer in self.layer:
-                x, decision = layer(x, global_condition, training = training)
+                x, decision, hard_ratio = layer(x, global_condition, training = training)
                 decision_avg += decision
+                hard_ratio_avg += hard_ratio
             decision_avg /= len(self.layer)
-            return x, decision_avg
+            hard_ratio_avg /= len(self.layer)
+            return x, decision_avg, hard_ratio_avg
         else:
             for layer in self.layer:
                 x = layer(x, global_condition, training = training)
             return x
-
-    def compute_flops(self, x):
-        flops = 0
-        for layer in self.layer:
-            flops += layer.compute_flops(x)
-        return flops
                 
 
 
@@ -848,7 +743,7 @@ class XRestormerLayer(nn.Module):
 ##########################################################################
 
 
-class CAPromptXRestormerEffv2(nn.Module):
+class CATAPromptXRestormer(nn.Module):
     def __init__(self,
         inp_channels=3,
         out_channels=3,
@@ -866,43 +761,45 @@ class CAPromptXRestormerEffv2(nn.Module):
         LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
         dual_pixel_task = False,        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
         scale = 1,
-        prompt = True
+        prompt = True,
+        hard_ratio = 0.5
     ):
 
-        super(CAPromptXRestormerEffv2, self).__init__()
+        super(CATAPromptXRestormer, self).__init__()
         print("Initializing XRestormer")
         self.scale = scale
         self.ratio = ratio
+        self.hard_ratio = hard_ratio
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
-        self.encoder_level1 = XRestormerLayer(dim=dim, window_size = window_size, ratio = ratio, num_channel_heads=channel_heads[0],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[0], num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.encoder_level1 = XRestormerLayer(dim=dim, window_size = window_size, ratio = ratio, num_channel_heads=channel_heads[0],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[0], num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         self.down1_2 = Downsample(dim) ## From Level 1 to Level 2
-        self.encoder_level2 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[1],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[1], num_heads = spatial_heads[1], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.encoder_level2 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[1],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[1], num_heads = spatial_heads[1], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         self.down2_3 = Downsample(int(dim*2**1)) ## From Level 2 to Level 3
-        self.encoder_level3 = XRestormerLayer(dim=int(dim*2**2), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[2],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[2], num_heads = spatial_heads[2], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.encoder_level3 = XRestormerLayer(dim=int(dim*2**2), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[2],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[2], num_heads = spatial_heads[2], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         self.down3_4 = Downsample(int(dim*2**2)) ## From Level 3 to Level 4
-        self.latent = XRestormerLayer(dim=int(dim*2**3), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[3], num_heads = spatial_heads[3], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.latent = XRestormerLayer(dim=int(dim*2**3), window_size = window_size, ratio = ratio,   num_channel_heads=channel_heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_blocks[3], num_heads = spatial_heads[3], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         #self.latent = nn.Sequential(*[TransformerBlock(dim=int(dim*2**3), window_size = window_size, overlap_ratio=0.5,  num_channel_heads=channel_heads[3], num_spatial_heads=8, spatial_dim_head = 16, ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
 
 
         self.up4_3 = Upsample(int(dim*2**2)) ## From Level 4 to Level 3
         self.reduce_chan_level3 = nn.Conv2d(int(dim*2**1) + 192, int(dim*2**2), kernel_size=1, bias=bias)
-        self.decoder_level3 = XRestormerLayer(dim=int(dim*2**2), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[2], num_heads = spatial_heads[2], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.decoder_level3 = XRestormerLayer(dim=int(dim*2**2), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[2], num_heads = spatial_heads[2], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
 
         self.up3_2 = Upsample(int(dim*2**2)) ## From Level 3 to Level 2
         self.reduce_chan_level2 = nn.Conv2d(int(dim*2**2), int(dim*2**1), kernel_size=1, bias=bias)
-        self.decoder_level2 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio, num_channel_heads=channel_heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[1], num_heads = spatial_heads[1], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.decoder_level2 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio, num_channel_heads=channel_heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[1], num_heads = spatial_heads[1], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         self.up2_1 = Upsample(int(dim*2**1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
 
-        self.decoder_level1 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[0], num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.decoder_level1 = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth = num_blocks[0], num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
-        self.refinement = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[0],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_refinement_blocks, num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio)
+        self.refinement = XRestormerLayer(dim=int(dim*2**1), window_size = window_size, ratio = ratio,  num_channel_heads=channel_heads[0],  ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type, depth=num_refinement_blocks, num_heads = spatial_heads[0], dim_head = dim_head, overlap_ratio = overlap_ratio, hard_ratio = hard_ratio)
 
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
@@ -941,24 +838,29 @@ class CAPromptXRestormerEffv2(nn.Module):
             # Encoder1
             
             decision_avg = 0
-            out_enc_level1, decision = self.encoder_level1(inp_enc_level1, condition_global, training = training)
+            hard_ratio_avg = 0
+            out_enc_level1, decision, hard_ratio = self.encoder_level1(inp_enc_level1, condition_global, training = training)
             inp_enc_level2 = self.down1_2(out_enc_level1)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
             
 
             # Encoder2
-            out_enc_level2, decision = self.encoder_level2(inp_enc_level2, condition_global_level2, training = training)
+            out_enc_level2, decision, hard_ratio = self.encoder_level2(inp_enc_level2, condition_global_level2, training = training)
             inp_enc_level3 = self.down2_3(out_enc_level2)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
             
             # Encoder3
-            out_enc_level3, decision = self.encoder_level3(inp_enc_level3, condition_global_level3, training = training)
+            out_enc_level3, decision, hard_ratio = self.encoder_level3(inp_enc_level3, condition_global_level3, training = training)
             inp_enc_level4 = self.down3_4(out_enc_level3)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
             
             # Bottleneck
-            latent, decision = self.latent(inp_enc_level4, condition_global_level4, training = training)
+            latent, decision, hard_ratio = self.latent(inp_enc_level4, condition_global_level4, training = training)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
 
             if self.prompt:
                 dec3_param = self.prompt3(latent)
@@ -970,8 +872,9 @@ class CAPromptXRestormerEffv2(nn.Module):
             inp_dec_level3 = self.up4_3(latent)
             inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
             inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
-            out_dec_level3, decision = self.decoder_level3(inp_dec_level3, condition_global_level3, training = training)
+            out_dec_level3, decision, hard_ratio = self.decoder_level3(inp_dec_level3, condition_global_level3, training = training)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
 
             if self.prompt:
                 dec2_param = self.prompt2(out_dec_level3)
@@ -983,8 +886,9 @@ class CAPromptXRestormerEffv2(nn.Module):
             inp_dec_level2 = self.up3_2(out_dec_level3)
             inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
             inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
-            out_dec_level2, decision = self.decoder_level2(inp_dec_level2, condition_global_level2, training = training)
+            out_dec_level2, decision, hard_ratio = self.decoder_level2(inp_dec_level2, condition_global_level2, training = training)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
 
             if self.prompt:
                 dec1_param = self.prompt1(out_dec_level2)
@@ -995,18 +899,23 @@ class CAPromptXRestormerEffv2(nn.Module):
 
             inp_dec_level1 = self.up2_1(out_dec_level2)
             inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
-            out_dec_level1, decision = self.decoder_level1(inp_dec_level1, condition_global, training = training)
+            out_dec_level1, decision, hard_ratio = self.decoder_level1(inp_dec_level1, condition_global, training = training)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
 
-            out_dec_level1, decision = self.refinement(out_dec_level1, condition_global, training = training)
+            out_dec_level1, decision, hard_ratio = self.refinement(out_dec_level1, condition_global, training = training)
             decision_avg += decision
+            hard_ratio_avg += hard_ratio
+
             out_dec_level1 = self.output(out_dec_level1) + inp_img
 
             decision_avg /= 8
+            hard_ratio_avg /= 8
 
             ratio_loss =  2*self.ratio*(torch.mean(decision_avg)-0.5)**2 
+            hard_ratio_loss = 2*self.hard_ratio*(torch.mean(hard_ratio_avg)-0.5)**2
 
-            return out_dec_level1, ratio_loss
+            return out_dec_level1, ratio_loss, hard_ratio_loss
 
         else:
             out_enc_level1 = self.encoder_level1(inp_enc_level1, condition_global, training = training)
@@ -1054,36 +963,9 @@ class CAPromptXRestormerEffv2(nn.Module):
 
             return out_dec_level1
 
-    def compute_flops(self, x):
-        N,C,H,W = x.shape
-        x_level1 = self.patch_embed(x)
-        x_level2 = self.down1_2(x_level1)
-        x_level3 = self.down2_3(x_level2)
-        x_level4 = self.down3_4(x_level3)
-        # patch_embed
-        patch_embed_flops = 3 * H * W * C * 3 * 3 * 48
-        # encoder_level1
-        encoder_level1_flops = self.encoder_level1.compute_flops(x_level1)
-        # encoder_level2
-        encoder_level2_flops = self.encoder_level2.compute_flops(x_level2)
-        # encoder_level3
-        encoder_level3_flops = self.encoder_level3.compute_flops(x_level3)
-        # latent
-        latent_flops = self.latent.compute_flops(x_level4)
-        # decoder_level3
-        decoder_level3_flops = self.decoder_level3.compute_flops(x_level3)
-        # decoder_level2
-        decoder_level2_flops = self.decoder_level2.compute_flops(x_level2)
-        # decoder_level1
-        decoder_level1_flops = self.decoder_level1.compute_flops(x_level1)
-        # refinement
-        refinement_flops = self.refinement.compute_flops(x_level1)
-        flops = patch_embed_flops + encoder_level1_flops + encoder_level2_flops + encoder_level3_flops + latent_flops + decoder_level3_flops + decoder_level2_flops + decoder_level1_flops + refinement_flops
-        return flops
-
 if __name__ == "__main__":
-    training = False
-    model = CAPromptXRestormerEffv2(
+    training = True
+    model = CATAPromptXRestormer(
         inp_channels=3,
         out_channels=3,
         dim = 48,
@@ -1100,19 +982,21 @@ if __name__ == "__main__":
         LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
         dual_pixel_task = False,        ## True for dual-pixel defocus deblurring only. Also set inp_channels=6
         scale = 1,
-        prompt = True
-        )
+        prompt = True,
+        hard_ratio = 0.5
+        ).cuda()
     
     # torchstat
-    # x = torch.randn(1, 3, 64, 64)
-    # if training:
-    #     y, ratio_loss = model(x, training=True)
+    x = torch.randn(4, 3, 64, 64).cuda()
+    if training:
+        y, ratio_loss , hard_ratio_loss = model(x, training=training)
+        print("output shape", y.shape)
+        print("Content ratio loss: %.2f"%ratio_loss.item())
+        print("Task ratio loss: %.2f"%hard_ratio_loss.item())
+    else:
+        y = model(x, training=training)
+        print("output shape", y.shape)
     
-    #     print("output shape", y.shape)
-    #     print("Complex ratio: %.2f"%ratio_loss.item())
-    # else:
-    #     y = model(x, training=False)
-    #     print("output shape", y.shape)
     # print('# model_restoration parameters: %.2f M'%(sum(param.numel() for param in model.parameters())/ 1e6))
     # stat(model, (3, 512, 512))
 
